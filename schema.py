@@ -65,6 +65,7 @@ class NewsArticle:
     original_article_type: Optional[str] = strawberry.field(default=None, name="original_article_type")
     featured: Optional[bool] = None
     categories: List[str] = strawberry.field(default_factory=list)
+    hero_image_url: Optional[str] = strawberry.field(default=None, name="hero_image_url")
 
 # For similar news articles
 @strawberry.type

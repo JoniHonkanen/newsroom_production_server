@@ -5,6 +5,9 @@
 .env.local
 .env.*.local
 
+# conversations are saved here for testing
+conversations_log/
+
 # Python
 __pycache__/
 *.py[cod]

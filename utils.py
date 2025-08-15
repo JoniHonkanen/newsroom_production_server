@@ -196,4 +196,6 @@ def map_db_row_to_news_article(row: Dict[str, Any]) -> NewsArticle:
         updated_at=format_datetime(row.get("updated_at")),
         original_article_type=row.get("original_article_type"),
         featured=row.get("featured"),
+        categories=row.get("categories", []),
+        hero_image_url=row.get("hero_image_url")
     )

@@ -42,7 +42,7 @@ class Query:
                 query = f"""
                     SELECT 
                         id, language, lead, summary,
-                        published_at, updated_at, categories
+                        published_at, updated_at, categories, hero_image_url
                     FROM news_article 
                     WHERE COALESCE(featured, false) = false
                     {order_clause}
@@ -86,7 +86,7 @@ class Query:
                     SELECT 
                         id, language, lead, summary,
                         location_tags, author,
-                        published_at, updated_at, featured, categories
+                        published_at, updated_at, featured, categories, hero_image_url
                     FROM news_article 
                     WHERE featured = true
                     {order_clause}
@@ -166,7 +166,7 @@ class Query:
                 query = f"""
                     SELECT DISTINCT
                         na.id, na.language, na.lead, na.summary, 
-                        na.published_at, na.updated_at, na.author, na.featured, na.categories
+                        na.published_at, na.updated_at, na.author, na.featured, na.categories, na.hero_image_url
                     FROM news_article na
                     JOIN news_article_category nac ON na.id = nac.article_id
                     JOIN category c ON c.id = nac.category_id
@@ -212,7 +212,7 @@ class Query:
                 query = f"""
                     SELECT DISTINCT
                         na.id, na.language, na.lead, na.summary, 
-                        na.published_at, na.updated_at, na.author, na.featured, na.categories
+                        na.published_at, na.updated_at, na.author, na.featured, na.categories, na.hero_image_url
                     FROM news_article na
                     JOIN news_article_category nac ON na.id = nac.article_id
                     JOIN category c ON c.id = nac.category_id
@@ -241,7 +241,7 @@ class Query:
                         id, canonical_news_id, language, version, lead, summary, status,
                         location_tags, sources, interviews, review_status, author,
                         body_blocks, enrichment_status, markdown_content,
-                        published_at, updated_at, original_article_type, featured, categories
+                        published_at, updated_at, original_article_type, featured, categories, hero_image_url
                     FROM news_article 
                     WHERE id = $1
                 """
@@ -297,7 +297,8 @@ class Query:
                         na.summary,
                         na.published_at,
                         na.updated_at,
-                        na.categories
+                        na.categories,
+                        na.hero_image_url
                     FROM news_article na
                     CROSS JOIN (
                         SELECT embedding 

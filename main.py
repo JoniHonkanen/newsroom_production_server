@@ -1,15 +1,29 @@
 # main.py
+import os
+import sys
+import asyncio
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 import strawberry
 from strawberry.fastapi import GraphQLRouter
-import os
 import logging
 from datetime import datetime
 from contextlib import asynccontextmanager
+from dotenv import load_dotenv
 
 from resolvers import Query
 from database import get_db_pool, close_db_pool
+from twilio_phone_service import setup_twilio_routes
+from vonage_phone_service import setup_vonage_routes
+
+# Load environment variables
+load_dotenv()
+
+# Windows event loop policy fix
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -48,12 +62,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# TODO:: REMEMBER UPDATE THESE WHEN WE GO FOR PRODUCTION
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
-        "http://192.168.1.102:3000", # Example IP address, replace with your frontend's address
+        "http://192.168.1.102:3000",  # Example IP address, replace with your frontend's address
         "http://localhost:3001",  # Add more origins as needed
     ],
     allow_credentials=True,
@@ -67,6 +82,9 @@ graphql_app = GraphQLRouter(schema)
 
 # Mount GraphQL endpoint
 app.include_router(graphql_app, prefix="/graphql")
+
+# Setup Twilio routes (for interview phone calls)
+setup_twilio_routes(app)
 
 
 # Health check endpoint
@@ -86,13 +104,28 @@ async def health_check():
 async def root():
     """Root endpoint with API information"""
     return {
-        "message": "News GraphQL API",
+        "message": "News GraphQL API with Twilio Integration",
         "version": "1.0.0",
-        "graphql_endpoint": "/graphql",
-        "health_check": "/health",
-        "docs": "/docs",
+        "endpoints": {
+            "graphql": "/graphql",
+            "health": "/health",
+            "docs": "/docs",
+            "incoming_call": "/incoming-call",
+            "trigger_call": "/trigger-call (POST)",
+            "media_stream": "/media-stream (WebSocket)",
+        },
     }
 
+
+# Serve static files (e.g., article images)
+# BECAUSE WE STILL DONT HAVE ANYPLACE TO STORE IMAGES... WE NEED TO SERVE THEM SOMEHOW
+# THATS WHY WE DO THIS "STUPID" WAY TO DO IT :D
+# TODO:: REMEMBER TO CHANGE PATH WHERE IS YOUR "NEWSROOM PRODUCTION"-program running
+app.mount(
+    "/static",
+    StaticFiles(directory=os.getenv("STATIC_FILE_PATH")),
+    name="static",
+)
 
 if __name__ == "__main__":
     import uvicorn
