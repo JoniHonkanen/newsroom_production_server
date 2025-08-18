@@ -11,6 +11,9 @@ from fastapi.websockets import WebSocketDisconnect
 import vonage
 from datetime import datetime
 
+# THIS IS NOT USED... THIS IS ALTERNATIVE FOR TWILIO
+# NEED TO TEST... 
+
 # Vonage-konfiguraatio
 VONAGE_APPLICATION_ID = os.getenv("VONAGE_APPLICATION_ID")
 VONAGE_PRIVATE_KEY = os.getenv("VONAGE_PRIVATE_KEY")  # Polku private key -tiedostoon

@@ -43,6 +43,7 @@ VOICE = "shimmer"
 
 # Global variable for current phone script
 current_phone_script = None
+current_article_id = None
 
 LOG_EVENT_TYPES = [
     "error",
@@ -102,6 +103,7 @@ def setup_twilio_routes(app: FastAPI):
 
             phone_number = body.get("phone_number")
             phone_script_json = body.get("phone_script_json")
+            news_article_id = body.get("article_id")
 
             # Legacy support
             system_prompt = body.get("system_prompt", "")
@@ -128,8 +130,12 @@ def setup_twilio_routes(app: FastAPI):
                 )
 
             # Tallenna phone_script_json globaalisti initialize_session:ia varten
-            global current_phone_script
+            global current_phone_script, current_article_id
             current_phone_script = phone_script_json
+            current_article_id = news_article_id
+
+            print("ÅÅÅÅÅÅÅÅÅÅÅÅÅÅÅÅÅÅ")
+            print("current_article_id: ", current_article_id)
 
             # Debug logging
             if phone_script_json:
@@ -366,6 +372,7 @@ def setup_twilio_routes(app: FastAPI):
                                 logger.error(f"OpenAI error: {response}")
                             continue
 
+                        # KÄYTTÄJÄN TRANSCRIPTION KÄSITTELY - PALAUTETTU
                         if (
                             response.get("type")
                             == "conversation.item.input_audio_transcription.completed"
@@ -382,9 +389,11 @@ def setup_twilio_routes(app: FastAPI):
                                         {"speaker": "user", "text": transcript_text}
                                     )
 
+                        # KORJATTU: response.done käsittely oikeassa paikassa
                         if response.get("type") == "response.done":
                             if SHOW_TIMING_MATH:
                                 print("[DEBUG] response.done received")
+
                             for item in response.get("response", {}).get("output", []):
                                 if item.get("type") == "message":
                                     last_assistant_item = item.get("id")
@@ -393,19 +402,57 @@ def setup_twilio_routes(app: FastAPI):
                                             part.get("type") == "audio"
                                             and "transcript" in part
                                         ):
+                                            transcript = part["transcript"]
+
+                                            # TUNNISTA LOPETUSSANAT
+                                            end_phrases = [
+                                                "kiitos haastattelusta",
+                                                "hyvää päivänjatkoa",
+                                                "haastattelu päättyi kiitos",
+                                                "nämä olivat kaikki kysymykset",
+                                            ]
+
+                                            if any(
+                                                phrase in transcript.lower()
+                                                for phrase in end_phrases
+                                            ):
+                                                logger.info(
+                                                    f"🔚 Detected interview end phrase in: {transcript}"
+                                                )
+
+                                                # Anna AI:lle hetki sanoa loppuun (2 sekuntia)
+                                                await asyncio.sleep(2)
+
+                                                call_ended = True
+                                                logger.info(
+                                                    "📞 Ending call after interview completion"
+                                                )
+
+                                                try:
+                                                    await websocket.close()
+                                                    await openai_ws.close()
+                                                    logger.info(
+                                                        "✅ Call ended successfully"
+                                                    )
+                                                except Exception as e:
+                                                    logger.warning(
+                                                        f"Error closing connections: {e}"
+                                                    )
+
+                                                return
+
+                                            # Tavallinen logging - VAIN AI:n vastaukset
                                             if (
-                                                part["transcript"]
+                                                transcript
                                                 and stream_sid in conversation_logs
                                             ):
                                                 conversation_logs[stream_sid].append(
                                                     {
                                                         "speaker": "assistant",
-                                                        "text": part["transcript"],
+                                                        "text": transcript,
                                                     }
                                                 )
-                                            logger.info(
-                                                f"🤖 Assistant: {part['transcript']}"
-                                            )
+                                            logger.info(f"🤖 Assistant: {transcript}")
 
                         if (
                             response.get("type") == "response.audio.delta"
@@ -471,7 +518,7 @@ def setup_twilio_routes(app: FastAPI):
                         print("[DEBUG] sent mark=responsePart")
 
             async def handle_speech_started_event():
-                """Truncate AI response when user starts speaking - with error handling."""
+                """Truncate AI response when user starts speaking - with IMPROVED timing."""
                 nonlocal response_start_timestamp_twilio, last_assistant_item, stream_sid
 
                 if not last_assistant_item or response_start_timestamp_twilio is None:
@@ -480,15 +527,10 @@ def setup_twilio_routes(app: FastAPI):
 
                 elapsed = latest_media_timestamp - response_start_timestamp_twilio
 
-                # Tarkista että truncation on järkevä
-                if elapsed < 100:
-                    logger.info(f"Audio too short to truncate ({elapsed}ms)")
-                    return
-
-                # Lisää turvamarginaali
-                if elapsed < 500:
+                #  Anna AI:lle aikaa sanoa asiansa loppuun
+                if elapsed < 3000:  # NOSTETTU 500ms → 3000ms (3 sekuntia)
                     logger.info(
-                        f"Audio truncation too close to start ({elapsed}ms), skipping"
+                        f"Too early to interrupt AI ({elapsed}ms) - letting it finish"
                     )
                     return
 
@@ -600,7 +642,7 @@ async def initialize_session(openai_ws):
                 f"Voice '{requested_voice}' not supported, using '{voice}' instead"
             )
 
-        temperature = current_phone_script.get("temperature", 0.8)  # Twilio käyttää 0.8
+        temperature = current_phone_script.get("temperature", 0.8)
         language = current_phone_script.get("language", "fi")
 
         clean_script = current_phone_script.copy()
@@ -608,7 +650,8 @@ async def initialize_session(openai_ws):
 
         instructions = (
             f"{base_instructions}\n\n"
-            "Alla on haastattelun rakenne JSON-muodossa, jota käytä keskustelun ohjaamiseen:\n\n"
+            "TÄRKEÄ: Kun olet kysynyt kaikki kysymykset ja kiittänyt haastattelusta, "
+            "sano selkeästi 'HAASTATTELU PÄÄTTYI KIITOS' ja lopeta puhuminen.\n\n"
             f"{json.dumps(clean_script, ensure_ascii=False, indent=2)}"
         )
 
@@ -619,15 +662,15 @@ async def initialize_session(openai_ws):
         temperature = 0.8
         language = "fi"
 
-    # TÄSMÄLLEEN kuten Twilio:n esimerkissä
+    # PARANNELTU: session update paremmilla keskeytyksien asetuksilla + transcription
     session_update = {
         "type": "session.update",
         "session": {
             "turn_detection": {
-                "type": "server_vad",  # OpenAI hoitaa tunnistuksen
-                "threshold": 0.6,  # Kuinka herkästi tunnistaa ääntä (0.0-1.0)
-                "silence_duration_ms": 800,  # Kuinka kauan hiljaista ennen AI:n vastausta
-                "create_response": True,  # Luo automaattisesti vastauksen hiljaisuuden jälkeen
+                "type": "server_vad",
+                "threshold": 0.75,  # NOSTETTU 0.6 → 0.75 (vähemmän herkkä)
+                "silence_duration_ms": 1500,  # NOSTETTU 800 → 1500ms (pidempi odotus)
+                "create_response": True,
                 "interrupt_response": True,
             },
             "input_audio_format": "g711_ulaw",
@@ -636,6 +679,12 @@ async def initialize_session(openai_ws):
             "instructions": instructions,
             "modalities": ["text", "audio"],
             "temperature": temperature,
+            # LISÄTTY: Transcription käyttäjän äänelle
+            "input_audio_transcription": {
+                "model": "whisper-1",
+                "language": language,
+                "prompt": TRANSCRIPTION_PROMPT,
+            },
         },
     }
 
@@ -656,7 +705,7 @@ async def initialize_session(openai_ws):
 
 
 async def save_conversation_log(stream_sid):
-    """Save conversation log to files based on stream_sid."""
+    """Save conversation log to files and UPDATE database using article_id."""
     try:
         if stream_sid not in conversation_logs or not conversation_logs[stream_sid]:
             logger.info(
@@ -666,6 +715,7 @@ async def save_conversation_log(stream_sid):
 
         conversation_log = conversation_logs.pop(stream_sid)
 
+        # Tallenna tiedostoihin (backup)
         log_dir = "conversations_log"
         os.makedirs(log_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -676,6 +726,7 @@ async def save_conversation_log(stream_sid):
         with open(log_filepath, "w", encoding="utf-8") as f:
             json.dump(conversation_log, f, ensure_ascii=False, indent=2)
 
+        # Luo dialogue_turns
         dialogue_turns = []
         for speaker, group in groupby(conversation_log, key=lambda x: x["speaker"]):
             texts = [msg["text"] for msg in group]
@@ -687,6 +738,25 @@ async def save_conversation_log(stream_sid):
         with open(turns_filepath, "w", encoding="utf-8") as f:
             json.dump(dialogue_turns, f, ensure_ascii=False, indent=2)
 
+        # PÄIVITÄ tietokanta käyttäen article_id:tä
+        global current_article_id
+        article_id = getattr(globals(), "current_article_id", None)
+
+        if article_id:
+            # THIS WILL SAVE INTERVIEW ANSWERS TO DB
+            interview_id = await update_interview_by_article_id(
+                article_id, dialogue_turns
+            )
+
+            if interview_id:
+                logger.info(
+                    f"✅ Interview {interview_id} updated for article {article_id}"
+                )
+            else:
+                logger.info(f"ℹ️ No initiated interview found for article: {article_id}")
+        else:
+            logger.info("ℹ️ No article_id available - this is likely a test call")
+
         logger.info(
             f"Conversation log for stream_sid {stream_sid} saved successfully ({len(conversation_log)} messages)"
         )
@@ -696,9 +766,80 @@ async def save_conversation_log(stream_sid):
         logger.error(f"Error saving conversation log for stream_sid {stream_sid}: {e}")
 
 
-# TODO: Implement database storage
-async def store_interview_in_database(dialogue_turns):
-    """Store interview data in the database for news generation."""
-    # This function should integrate with your existing database
-    # to store interview transcripts for the news generation pipeline
-    pass
+# WE NEED TO UPDATE INTERVIEW TO THE DATABASE
+# WE ARE USING ARTICLE_ID (what we get from "start_interview(request: Request)") TO IDENTIFY THE INTERVIEW and correct ARTICLE
+async def update_interview_by_article_id(article_id, dialogue_turns):
+    """Update existing phone interview with transcript using article_id."""
+    try:
+        import asyncpg
+
+        # Database connection
+        conn = await asyncpg.connect(
+            host=os.getenv("DB_HOST", "localhost"),
+            port=os.getenv("DB_PORT", 5432),
+            user=os.getenv("DB_USER", "postgres"),
+            password=os.getenv("DB_PASSWORD"),
+            database=os.getenv("DB_NAME", "newsroom"),
+        )
+
+        # Prepare transcript data
+        transcript_json = {
+            "dialogue_turns": dialogue_turns,
+            "call_metadata": {
+                "completed_at": datetime.now().isoformat(),
+                "total_turns": len(dialogue_turns),
+                "total_assistant_messages": len(
+                    [t for t in dialogue_turns if t.get("speaker") == "assistant"]
+                ),
+                "total_user_messages": len(
+                    [t for t in dialogue_turns if t.get("speaker") == "user"]
+                ),
+            },
+        }
+
+        # Etsi viimeisin "initiated" status interview tälle article_id:lle
+        update_query = """
+            UPDATE phone_interview 
+            SET 
+                transcript_json = $1,
+                status = $2
+            WHERE news_article_id = $3 
+            RETURNING id
+        """
+
+        interview_id = await conn.fetchval(
+            update_query,
+            json.dumps(transcript_json),  # $1 - transcript as JSONB
+            "completed",  # $2 - new status
+            article_id,  # $3 - article_id (news_article_id kolumnissa)
+        )
+
+        if interview_id:
+            # Päivitä myös phone_interview_attempt jos sellainen on
+            await conn.execute(
+                """
+                UPDATE phone_interview_attempt 
+                SET ended_at = NOW(), status = $1
+                WHERE phone_interview_id = $2
+                """,
+                "completed",
+                interview_id,
+            )
+
+            logger.info(
+                f"📊 Updated interview ID {interview_id} for article {article_id} with transcript ({len(dialogue_turns)} turns)"
+            )
+        else:
+            logger.warning(
+                f"⚠️ No initiated phone_interview found for article: {article_id}"
+            )
+            logger.info(
+                "This might be a test call or the interview was already completed"
+            )
+
+        await conn.close()
+        return interview_id
+
+    except Exception as e:
+        logger.error(f"❌ Failed to update interview in database: {e}")
+        return None
