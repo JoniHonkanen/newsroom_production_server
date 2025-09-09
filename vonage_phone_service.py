@@ -10,15 +10,34 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
 import vonage
 from datetime import datetime
+from dotenv import load_dotenv
+
+# Lataa .env tiedosto
+load_dotenv()
 
 # THIS IS NOT USED... THIS IS ALTERNATIVE FOR TWILIO
-# NEED TO TEST... 
+# NEED TO TEST...
 
 # Vonage-konfiguraatio
 VONAGE_APPLICATION_ID = os.getenv("VONAGE_APPLICATION_ID")
-VONAGE_PRIVATE_KEY = os.getenv("VONAGE_PRIVATE_KEY")  # Polku private key -tiedostoon
+VONAGE_PRIVATE_KEY_PATH = os.getenv("VONAGE_PRIVATE_KEY")  # Polku private key -tiedostoon
 VONAGE_NUMBER = os.getenv("VONAGE_NUMBER")
 WEBHOOK_BASE_URL = os.getenv("LOCALTUNNEL_URL")  # Sama kuin LOCALTUNNEL_URL, vain nimi vaihtui
+
+# Lue private key tiedostosta
+if VONAGE_PRIVATE_KEY_PATH and os.path.exists(VONAGE_PRIVATE_KEY_PATH):
+    with open(VONAGE_PRIVATE_KEY_PATH, 'r') as f:
+        VONAGE_PRIVATE_KEY = f.read()
+else:
+    print(f"Private key tiedostoa ei löydy: {VONAGE_PRIVATE_KEY_PATH}")
+    VONAGE_PRIVATE_KEY = None
+
+print("APPLICATION_ID:", VONAGE_APPLICATION_ID)
+print("PRIVATE_KEY exists:", bool(VONAGE_PRIVATE_KEY))
+print(
+    "PRIVATE_KEY preview:",
+    VONAGE_PRIVATE_KEY[:100] if VONAGE_PRIVATE_KEY else "MISSING",
+)
 
 SYSTEM_MESSAGE = (
     "You are a journalist conducting a relaxed and friendly interview in Finnish. "
@@ -48,10 +67,7 @@ from vonage import Vonage, Auth
 from vonage_voice import CreateCallRequest
 
 # Vonage-client - Versio 4.x syntaksi
-auth = Auth(
-    application_id=VONAGE_APPLICATION_ID,
-    private_key=VONAGE_PRIVATE_KEY
-)
+auth = Auth(application_id=VONAGE_APPLICATION_ID, private_key=VONAGE_PRIVATE_KEY)
 vonage_client = Vonage(auth=auth)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -85,19 +101,18 @@ def setup_vonage_routes(app: FastAPI):
                 {
                     "action": "talk",
                     "text": "Yhdistän sinut haastatteluun.",
-                    "language": "fi-FI"
+                    "language": "fi-FI",
                 },
                 {
                     "action": "connect",
-                    "from": VONAGE_NUMBER,
                     "endpoint": [
                         {
                             "type": "websocket",
                             "uri": f"{WEBHOOK_BASE_URL.replace('https://', 'wss://')}/websocket",
-                            "content-type": "audio/l16;rate=16000"
+                            "content-type": "audio/l16;rate=16000",
                         }
-                    ]
-                }
+                    ],
+                },
             ]
 
             logger.info("Incoming call handled, connecting to WebSocket")
@@ -109,7 +124,7 @@ def setup_vonage_routes(app: FastAPI):
                 {
                     "action": "talk",
                     "text": "Pahoittelemme, puhelun yhdistämisessä tapahtui virhe. Yritä myöhemmin uudelleen.",
-                    "language": "fi-FI"
+                    "language": "fi-FI",
                 }
             ]
             return JSONResponse(content=ncco)
@@ -160,31 +175,30 @@ def setup_vonage_routes(app: FastAPI):
                 {
                     "action": "talk",
                     "text": "Yhdistän sinut haastatteluun.",
-                    "language": "fi-FI"
+                    "language": "fi-FI",
                 },
                 {
                     "action": "connect",
-                    "from": VONAGE_NUMBER,
                     "endpoint": [
                         {
                             "type": "websocket",
                             "uri": f"{WEBHOOK_BASE_URL.replace('https://', 'wss://')}/websocket",
-                            "content-type": "audio/l16;rate=16000"
+                            "content-type": "audio/l16;rate=16000",
                         }
-                    ]
-                }
+                    ],
+                },
             ]
 
-            # Vonage-pyyntö on korjattu tässä
+            # Korjattu: numeroita ilman + merkkiä
             call_request = CreateCallRequest(
-                to=[{'type': 'phone', 'number': phone_number}],
-                from_={'type': 'phone', 'number': VONAGE_NUMBER},
-                ncco=ncco
+                to=[{"type": "phone", "number": phone_number}],
+                from_={"type": "phone", "number": VONAGE_NUMBER},  # Ilman + merkkiä
+                ncco=ncco,
             )
 
             response = vonage_client.voice.create_call(call_request)
             call_uuid = response.uuid
-            
+
             logger.info(
                 f"Vonage interview call initiated - UUID: {call_uuid}, To: {phone_number}"
             )
@@ -211,16 +225,19 @@ def setup_vonage_routes(app: FastAPI):
                 content={"error": f"Failed to start interview: {str(e)}"},
             )
         finally:
+
             async def restore_message():
                 await asyncio.sleep(300)
                 global SYSTEM_MESSAGE
                 SYSTEM_MESSAGE = original_message
                 logger.info("System message restored to default")
+
             asyncio.create_task(restore_message())
 
     @app.post("/trigger-call")
     async def trigger_call():
         """Trigger a default call using environment variables"""
+        print("TRIGGER CALL!!!")
         try:
             if not VONAGE_NUMBER:
                 return JSONResponse(
@@ -228,11 +245,16 @@ def setup_vonage_routes(app: FastAPI):
                     content={"error": "Missing VONAGE_NUMBER environment variable"},
                 )
 
-            to_number = os.getenv("WHERE_TO_CALL")
+            to_number = os.getenv("WHERE_TO_CALL_VONAGE")
+            print("SOITETAAN NUMEROON:", repr(to_number))
+            print("TÄÄ SOITTAA:", repr(VONAGE_NUMBER))
+
             if not to_number:
                 return JSONResponse(
                     status_code=400,
-                    content={"error": "Missing WHERE_TO_CALL environment variable"},
+                    content={
+                        "error": "Missing WHERE_TO_CALL_VONAGE environment variable"
+                    },
                 )
 
             if not WEBHOOK_BASE_URL:
@@ -245,39 +267,40 @@ def setup_vonage_routes(app: FastAPI):
                 {
                     "action": "talk",
                     "text": "Yhdistän sinut haastatteluun.",
-                    "language": "fi-FI"
+                    "language": "fi-FI",
                 },
                 {
                     "action": "connect",
-                    "from": VONAGE_NUMBER,
                     "endpoint": [
                         {
                             "type": "websocket",
                             "uri": f"{WEBHOOK_BASE_URL.replace('https://', 'wss://')}/websocket",
-                            "content-type": "audio/l16;rate=16000"
+                            "content-type": "audio/l16;rate=16000",
                         }
-                    ]
-                }
+                    ],
+                },
             ]
-            
-            print("TÄÄÄÄÄ!!!")
-            print(ncco)
 
-            # Vonage-pyyntö on korjattu tässä
-            call_request = CreateCallRequest(
-                to=[{'type': 'phone', 'number': to_number}],
-                #from_={'type': 'phone', 'number': VONAGE_NUMBER},
-                ncco=ncco,
-                random_from_number=True
-            )
+            print("NCCO:", ncco)
+
+            # Korjattu: käytä from_ parametria ilman + merkkejä
+            call_params = {
+                "to": [{"type": "phone", "number": to_number}],
+                "from_": {"type": "phone", "number": VONAGE_NUMBER},  # Ilman + merkkiä
+                "ncco": ncco,
+            }
+            print("call_params ennen CreateCallRequest:", call_params)
+
+            call_request = CreateCallRequest(**call_params)
+            print("call_request luotu:", call_request)
 
             response = vonage_client.voice.create_call(call_request)
             call_uuid = response.uuid
-            
+
             logger.info(
                 f"Default Vonage call initiated - UUID: {call_uuid}, To: {to_number}"
             )
-            
+
             conversation_logs[call_uuid] = []
 
             return JSONResponse(
@@ -295,6 +318,17 @@ def setup_vonage_routes(app: FastAPI):
             return JSONResponse(
                 status_code=500, content={"error": f"Failed to initiate call: {str(e)}"}
             )
+
+    @app.post("/events")
+    async def handle_vonage_events(request: Request):
+        """Handle Vonage event webhooks"""
+        try:
+            event_data = await request.json()
+            logger.info(f"Vonage event: {event_data}")
+            return {"status": "received"}
+        except Exception as e:
+            logger.error(f"Event handling error: {e}")
+            return {"status": "error"}
 
     @app.websocket("/websocket")
     async def handle_websocket_connection(websocket: WebSocket):
@@ -314,7 +348,7 @@ def setup_vonage_routes(app: FastAPI):
         mark_queue = []
         response_start_timestamp = None
         call_ended = False
-        
+
         try:
             logger.info("Connecting to OpenAI Realtime API...")
             openai_ws = await websockets.connect(
@@ -325,7 +359,7 @@ def setup_vonage_routes(app: FastAPI):
                 },
             )
             logger.info("Successfully connected to OpenAI")
-            
+
             await initialize_session(openai_ws)
 
             async def receive_from_vonage():
@@ -343,12 +377,14 @@ def setup_vonage_routes(app: FastAPI):
                                 # Tämä on yksinkertaistettu - oikeassa toteutuksessa tarvitsisi
                                 # kunnollisen audio resampling -kirjaston
                                 audio_b64 = base64.b64encode(audio_data).decode()
-                                
+
                                 await openai_ws.send(
-                                    json.dumps({
-                                        "type": "input_audio_buffer.append",
-                                        "audio": audio_b64,
-                                    })
+                                    json.dumps(
+                                        {
+                                            "type": "input_audio_buffer.append",
+                                            "audio": audio_b64,
+                                        }
+                                    )
                                 )
                             except Exception as e:
                                 logger.error(f"Error processing Vonage audio: {e}")
@@ -370,9 +406,9 @@ def setup_vonage_routes(app: FastAPI):
                         if call_ended:
                             logger.info("Call has ended, stopping send_to_vonage")
                             break
-                            
+
                         response = json.loads(openai_message)
-                        
+
                         if response.get("type") == "session.created":
                             logger.info("OpenAI session created successfully")
 
@@ -380,27 +416,39 @@ def setup_vonage_routes(app: FastAPI):
                             logger.error(f"OpenAI error: {response}")
                             continue
 
-                        if response.get("type") == "conversation.item.input_audio_transcription.completed":
+                        if (
+                            response.get("type")
+                            == "conversation.item.input_audio_transcription.completed"
+                        ):
                             transcript_text = response.get("transcript", "").strip()
                             if transcript_text and call_uuid in conversation_logs:
                                 logger.info(f"🎤 User: {transcript_text}")
-                                conversation_logs[call_uuid].append({
-                                    "speaker": "user", 
-                                    "text": transcript_text
-                                })
+                                conversation_logs[call_uuid].append(
+                                    {"speaker": "user", "text": transcript_text}
+                                )
 
                         if response.get("type") == "response.done":
                             for item in response.get("response", {}).get("output", []):
                                 if item.get("type") == "message":
                                     last_assistant_item = item.get("id")
                                     for part in item.get("content", []):
-                                        if part.get("type") == "audio" and "transcript" in part:
-                                            if part["transcript"] and call_uuid in conversation_logs:
-                                                conversation_logs[call_uuid].append({
-                                                    "speaker": "assistant",
-                                                    "text": part["transcript"],
-                                                })
-                                            logger.info(f"🤖 Assistant: {part['transcript']}")
+                                        if (
+                                            part.get("type") == "audio"
+                                            and "transcript" in part
+                                        ):
+                                            if (
+                                                part["transcript"]
+                                                and call_uuid in conversation_logs
+                                            ):
+                                                conversation_logs[call_uuid].append(
+                                                    {
+                                                        "speaker": "assistant",
+                                                        "text": part["transcript"],
+                                                    }
+                                                )
+                                            logger.info(
+                                                f"🤖 Assistant: {part['transcript']}"
+                                            )
 
                         if response.get("type") == "response.audio.delta":
                             try:
@@ -408,10 +456,10 @@ def setup_vonage_routes(app: FastAPI):
                                 audio_data = base64.b64decode(response["delta"])
                                 # Tässäkin tarvittaisiin kunnollinen resämplöinti
                                 audio_b64 = base64.b64encode(audio_data).decode()
-                                
+
                                 # Lähetä Vonagelle
                                 await websocket.send_text(audio_b64)
-                                
+
                                 if response_start_timestamp is None:
                                     response_start_timestamp = latest_media_timestamp
 
@@ -425,7 +473,9 @@ def setup_vonage_routes(app: FastAPI):
                         if response.get("type") == "input_audio_buffer.speech_started":
                             logger.info("🗣️ Speech started detected")
                             if last_assistant_item:
-                                logger.info(f"Interrupting response id={last_assistant_item}")
+                                logger.info(
+                                    f"Interrupting response id={last_assistant_item}"
+                                )
                                 await handle_speech_started_event()
 
                 except WebSocketDisconnect:
@@ -438,12 +488,12 @@ def setup_vonage_routes(app: FastAPI):
             async def handle_speech_started_event():
                 """Truncate AI response when user starts speaking."""
                 nonlocal response_start_timestamp, last_assistant_item
-                
+
                 if not last_assistant_item or response_start_timestamp is None:
                     return
-                    
+
                 elapsed = latest_media_timestamp - response_start_timestamp
-                
+
                 if elapsed < 100:
                     return
 
@@ -464,12 +514,14 @@ def setup_vonage_routes(app: FastAPI):
             logger.info("Starting async tasks for Vonage WebSocket")
             tasks = [
                 asyncio.create_task(receive_from_vonage()),
-                asyncio.create_task(send_to_vonage())
+                asyncio.create_task(send_to_vonage()),
             ]
-            
-            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+            done, pending = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_COMPLETED
+            )
             call_ended = True
-            
+
             for task in pending:
                 task.cancel()
                 try:
@@ -481,13 +533,13 @@ def setup_vonage_routes(app: FastAPI):
             logger.error(f"Error in Vonage WebSocket: {e}")
         finally:
             logger.info("Cleaning up Vonage WebSocket resources")
-            
+
             if openai_ws:
                 try:
                     await openai_ws.close()
                 except Exception:
                     pass
-            
+
             try:
                 await websocket.close()
             except Exception:
@@ -506,14 +558,14 @@ async def initialize_session(openai_ws):
                 "type": "server_vad",
             },
             "input_audio_format": "g711_ulaw",  # Tämä pitää ehkä muuttaa L16:ksi
-            "output_audio_format": "g711_ulaw", # Tämä pitää ehkä muuttaa L16:ksi
+            "output_audio_format": "g711_ulaw",  # Tämä pitää ehkä muuttaa L16:ksi
             "voice": VOICE,
             "instructions": SYSTEM_MESSAGE,
             "modalities": ["text", "audio"],
             "temperature": 0.8,
         },
     }
-    
+
     logger.info("Initializing OpenAI session for Vonage integration")
     await openai_ws.send(json.dumps(session_update))
 
@@ -521,8 +573,8 @@ async def initialize_session(openai_ws):
         "type": "response.create",
         "response": {
             "modalities": ["text", "audio"],
-            "prompt": "Start the interview immediately by greeting the interviewee in Finnish and explaining the topic. Remember to speak ONLY Finnish."
-        }
+            "prompt": "Start the interview immediately by greeting the interviewee in Finnish and explaining the topic. Remember to speak ONLY Finnish.",
+        },
     }
     await openai_ws.send(json.dumps(create_message))
     logger.info("Interview started via OpenAI")
@@ -536,12 +588,14 @@ async def save_conversation_log(call_uuid):
             return
 
         conversation_log = conversation_logs.pop(call_uuid)
-        
+
         log_dir = "conversations_log"
         os.makedirs(log_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_filepath = os.path.join(log_dir, f"conversation_log_{call_uuid}_{timestamp}.json")
-        
+        log_filepath = os.path.join(
+            log_dir, f"conversation_log_{call_uuid}_{timestamp}.json"
+        )
+
         with open(log_filepath, "w", encoding="utf-8") as f:
             json.dump(conversation_log, f, ensure_ascii=False, indent=2)
 
@@ -550,7 +604,9 @@ async def save_conversation_log(call_uuid):
             texts = [msg["text"] for msg in group]
             dialogue_turns.append({"speaker": speaker, "text": "\n".join(texts)})
 
-        turns_filepath = os.path.join(log_dir, f"conversation_turns_{call_uuid}_{timestamp}.json")
+        turns_filepath = os.path.join(
+            log_dir, f"conversation_turns_{call_uuid}_{timestamp}.json"
+        )
         with open(turns_filepath, "w", encoding="utf-8") as f:
             json.dump(dialogue_turns, f, ensure_ascii=False, indent=2)
 
@@ -561,7 +617,7 @@ async def save_conversation_log(call_uuid):
 
 
 # Setup routes
-setup_vonage_routes(app)
+#setup_vonage_routes(app)
 
 
 # TODO: Implement database storage
