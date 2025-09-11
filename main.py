@@ -84,8 +84,8 @@ graphql_app = GraphQLRouter(schema)
 app.include_router(graphql_app, prefix="/graphql")
 
 # Setup Twilio routes (for interview phone calls)
-#setup_twilio_routes(app)
-setup_vonage_routes(app)
+setup_twilio_routes(app)
+#setup_vonage_routes(app)
 
 
 # Health check endpoint

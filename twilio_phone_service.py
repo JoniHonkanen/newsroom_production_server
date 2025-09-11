@@ -29,8 +29,10 @@ SYSTEM_MESSAGE = (
 
 TRANSCRIPTION_PROMPT = (
     "Tämä on reaaliaikainen suomenkielinen haastattelu. "
-    "Keskustelu voi sisältää kysymyksiä, spontaaneja vastauksia, täytesanoja ja erikoistermejä. "
-    "Kirjoita kaikki sanat tarkasti ja selkeästi, säilytä välimerkit ja luonnolliset tauot aina kun mahdollista."
+    "Keskustelu voi sisältää kysymyksiä, spontaaneja vastauksia, täytesanoja, taukoja ja erikoistermejä. "
+    "Kirjoita kaikki sanat täsmällisesti niin kuin ne kuullaan. "
+    "Säilytä välimerkit, tauot ja täytesanat. "
+    "Jos jokin sana on epäselvä, merkitse se selvästi esimerkiksi '(epäselvä)'."
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -61,6 +63,19 @@ SHOW_TIMING_MATH = False
 app = FastAPI()
 
 conversation_logs = {}
+"""
+Map Twilio Media Stream streamSid -> Twilio Call SID, so we can end the
+underlying PSTN call when the websocket stream ends.
+"""
+stream_to_call = {}
+"""
+Track article_id associations so transcripts are stored against the correct
+article, even with concurrent calls.
+call_to_article maps callSid -> article_id
+stream_to_article maps streamSid -> article_id
+"""
+call_to_article = {}
+stream_to_article = {}
 
 
 def setup_twilio_routes(app: FastAPI):
@@ -160,6 +175,10 @@ def setup_twilio_routes(app: FastAPI):
                 f"Interview call initiated - SID: {call.sid}, To: {phone_number}"
             )
             conversation_logs[call.sid] = []
+
+            # Link this call to the news article so we can persist correctly later
+            if news_article_id:
+                call_to_article[call.sid] = news_article_id
 
             return JSONResponse(
                 content={
@@ -309,6 +328,25 @@ def setup_twilio_routes(app: FastAPI):
                             if stream_sid not in conversation_logs:
                                 conversation_logs[stream_sid] = []
 
+                            # Link streamSid -> callSid for proper teardown later
+                            call_sid = data["start"].get("callSid")
+                            if call_sid:
+                                stream_to_call[stream_sid] = call_sid
+                                logger.info(
+                                    f"Linked streamSid {stream_sid} -> callSid {call_sid}"
+                                )
+                                # Also link stream to article, via call mapping
+                                article_id_for_call = call_to_article.get(call_sid)
+                                if article_id_for_call is not None:
+                                    stream_to_article[stream_sid] = article_id_for_call
+                                    logger.info(
+                                        f"Linked streamSid {stream_sid} -> article_id {article_id_for_call}"
+                                    )
+                            else:
+                                logger.warning(
+                                    "start event missing callSid – cannot link stream to call"
+                                )
+
                             logger.info(
                                 "Stream started, waiting for AI to respond based on initial session config."
                             )
@@ -316,6 +354,25 @@ def setup_twilio_routes(app: FastAPI):
                         elif data["event"] == "stop":
                             logger.info(f"Stream {stream_sid} has stopped")
                             call_ended = True
+                            # Katkaise puhelu Twilion REST API:lla
+                            # Jos puhelu ei katkea... se jää "päälle" ikuisesti
+                            try:
+                                call_sid = stream_to_call.get(stream_sid)
+                                if call_sid:
+                                    twilio_client.calls(call_sid).update(status="completed")
+                                    logger.info(f"☎️ Puhelu {call_sid} päätetty Twilion päästä")
+                                else:
+                                    logger.warning(
+                                        f"No callSid found for streamSid {stream_sid}; cannot end call via API"
+                                    )
+                            except Exception as e:
+                                logger.error(f"Error ending call via Twilio API: {e}")
+                            finally:
+                                # Cleanup mapping for this stream
+                                cs = stream_to_call.pop(stream_sid, None)
+                                if cs:
+                                    call_to_article.pop(cs, None)
+                                stream_to_article.pop(stream_sid, None)
                             break
 
                         elif data["event"] == "mark" and mark_queue:
@@ -323,7 +380,30 @@ def setup_twilio_routes(app: FastAPI):
 
                 except WebSocketDisconnect:
                     logger.info("Twilio WebSocket disconnected")
-                    call_ended = True
+                    if not call_ended:
+                        call_ended = True
+                        # Safety: end the PSTN call if we still know the callSid
+                        try:
+                            call_sid = stream_to_call.get(stream_sid)
+                            if call_sid:
+                                twilio_client.calls(call_sid).update(status="completed")
+                                logger.info(
+                                    f"☎️ Puhelu {call_sid} päätetty Twilion päästä (WS disconnect)"
+                                )
+                            else:
+                                logger.warning(
+                                    f"No callSid mapping for streamSid {stream_sid} on disconnect"
+                                )
+                        except Exception as e:
+                            logger.error(
+                                f"Error ending call via Twilio API on disconnect: {e}"
+                            )
+                        finally:
+                            # Clean mapping regardless
+                            cs = stream_to_call.pop(stream_sid, None)
+                            if cs:
+                                call_to_article.pop(cs, None)
+                            stream_to_article.pop(stream_sid, None)
                 except Exception as e:
                     logger.error(f"Error in receive_from_twilio: {e}")
                     call_ended = True
@@ -669,7 +749,7 @@ async def initialize_session(openai_ws):
             "turn_detection": {
                 "type": "server_vad",
                 "threshold": 0.75,  # NOSTETTU 0.6 → 0.75 (vähemmän herkkä)
-                "silence_duration_ms": 1500,  # NOSTETTU 800 → 1500ms (pidempi odotus)
+                "silence_duration_ms": 1200,  # NOSTETTU 800 → 1500ms (pidempi odotus)
                 "create_response": True,
                 "interrupt_response": True,
             },
@@ -682,7 +762,8 @@ async def initialize_session(openai_ws):
             # LISÄTTY: Transcription käyttäjän äänelle
             "input_audio_transcription": {
                 "model": "whisper-1",
-                "language": language,
+                #"language": language,
+                "language": "fi",
                 "prompt": TRANSCRIPTION_PROMPT,
             },
         },
@@ -739,10 +820,13 @@ async def save_conversation_log(stream_sid):
             json.dump(dialogue_turns, f, ensure_ascii=False, indent=2)
 
         # PÄIVITÄ tietokanta käyttäen article_id:tä
+        # Prefer stream-specific mapping; fall back to global (single-call case)
         global current_article_id
-        article_id = getattr(globals(), "current_article_id", None)
+        article_id = stream_to_article.pop(stream_sid, None)
+        if article_id is None:
+            article_id = current_article_id  # fallback for legacy/test flows
 
-        if article_id:
+        if article_id is not None:
             # THIS WILL SAVE INTERVIEW ANSWERS TO DB
             interview_id = await update_interview_by_article_id(
                 article_id, dialogue_turns
