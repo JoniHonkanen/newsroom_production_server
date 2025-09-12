@@ -505,14 +505,19 @@ def setup_twilio_routes(app: FastAPI):
                                                     "📞 Ending call after interview completion"
                                                 )
                                                 try:
-                                                    if websocket.client_state != WebSocketState.DISCONNECTED:
+                                                    if (
+                                                        websocket.client_state
+                                                        != WebSocketState.DISCONNECTED
+                                                    ):
                                                         await websocket.close()
                                                     # Prefer `.closed` attr; fallback to `.open`
                                                     if hasattr(openai_ws, "closed"):
                                                         if not openai_ws.closed:
                                                             await openai_ws.close()
                                                     else:
-                                                        if getattr(openai_ws, "open", False):
+                                                        if getattr(
+                                                            openai_ws, "open", False
+                                                        ):
                                                             await openai_ws.close()
                                                     logger.info(
                                                         "✅ Call ended successfully"
@@ -554,7 +559,9 @@ def setup_twilio_routes(app: FastAPI):
                                         }
                                     )
                                 else:
-                                    logger.info("WebSocket not connected; stopping audio send")
+                                    logger.info(
+                                        "WebSocket not connected; stopping audio send"
+                                    )
                                     break
 
                                 if response_start_timestamp_twilio is None:
