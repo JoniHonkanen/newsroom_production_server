@@ -792,8 +792,6 @@ async def initialize_session(openai_ws):
             "instructions": instructions,
             "modalities": ["text", "audio"],
             "temperature": temperature,
-            "language": "fi",
-            # LISÄTTY: Transcription käyttäjän äänelle
             "input_audio_transcription": {
                 "model": "whisper-1",
                 # "language": language,
