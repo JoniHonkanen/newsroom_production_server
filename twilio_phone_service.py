@@ -2,12 +2,14 @@ import os
 import json
 import base64
 import asyncio
+from urllib import response
 import websockets
 import logging
 from itertools import groupby
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
+from starlette.websockets import WebSocketState
 from twilio.twiml.voice_response import VoiceResponse, Connect
 from twilio.rest import Client
 from datetime import datetime
@@ -273,6 +275,7 @@ def setup_twilio_routes(app: FastAPI):
             await websocket.close(code=1008, reason="OpenAI API key not configured")
             return
 
+        # Local state
         openai_ws = None
         stream_sid = None
         latest_media_timestamp = 0
@@ -280,6 +283,8 @@ def setup_twilio_routes(app: FastAPI):
         mark_queue = []
         response_start_timestamp_twilio = None
         call_ended = False
+        ai_audio_ms_sent = 0  # ms of AI audio sent to Twilio for current response
+        is_response_active = False  # track active AI response to avoid duplicates
 
         try:
             logger.info("Connecting to OpenAI Realtime API...")
@@ -295,7 +300,7 @@ def setup_twilio_routes(app: FastAPI):
             await initialize_session(openai_ws)
 
             async def receive_from_twilio():
-                nonlocal stream_sid, latest_media_timestamp, call_ended
+                nonlocal stream_sid, latest_media_timestamp, call_ended, last_assistant_item, response_start_timestamp_twilio
                 logger.info("Starting receive_from_twilio task")
                 try:
                     async for message in websocket.iter_text():
@@ -306,14 +311,11 @@ def setup_twilio_routes(app: FastAPI):
                             if "timestamp" in data["media"]:
                                 latest_media_timestamp = int(data["media"]["timestamp"])
 
-                            # Suoraan kuten Twilio:n esimerkissä - EI konversiota
                             await openai_ws.send(
                                 json.dumps(
                                     {
                                         "type": "input_audio_buffer.append",
-                                        "audio": data["media"][
-                                            "payload"
-                                        ],  # Suoraan payload
+                                        "audio": data["media"]["payload"],
                                     }
                                 )
                             )
@@ -328,14 +330,12 @@ def setup_twilio_routes(app: FastAPI):
                             if stream_sid not in conversation_logs:
                                 conversation_logs[stream_sid] = []
 
-                            # Link streamSid -> callSid for proper teardown later
                             call_sid = data["start"].get("callSid")
                             if call_sid:
                                 stream_to_call[stream_sid] = call_sid
                                 logger.info(
                                     f"Linked streamSid {stream_sid} -> callSid {call_sid}"
                                 )
-                                # Also link stream to article, via call mapping
                                 article_id_for_call = call_to_article.get(call_sid)
                                 if article_id_for_call is not None:
                                     stream_to_article[stream_sid] = article_id_for_call
@@ -354,13 +354,15 @@ def setup_twilio_routes(app: FastAPI):
                         elif data["event"] == "stop":
                             logger.info(f"Stream {stream_sid} has stopped")
                             call_ended = True
-                            # Katkaise puhelu Twilion REST API:lla
-                            # Jos puhelu ei katkea... se jää "päälle" ikuisesti
                             try:
                                 call_sid = stream_to_call.get(stream_sid)
                                 if call_sid:
-                                    twilio_client.calls(call_sid).update(status="completed")
-                                    logger.info(f"☎️ Puhelu {call_sid} päätetty Twilion päästä")
+                                    twilio_client.calls(call_sid).update(
+                                        status="completed"
+                                    )
+                                    logger.info(
+                                        f"☎️ Puhelu {call_sid} päätetty Twilion päästä"
+                                    )
                                 else:
                                     logger.warning(
                                         f"No callSid found for streamSid {stream_sid}; cannot end call via API"
@@ -368,7 +370,6 @@ def setup_twilio_routes(app: FastAPI):
                             except Exception as e:
                                 logger.error(f"Error ending call via Twilio API: {e}")
                             finally:
-                                # Cleanup mapping for this stream
                                 cs = stream_to_call.pop(stream_sid, None)
                                 if cs:
                                     call_to_article.pop(cs, None)
@@ -382,7 +383,6 @@ def setup_twilio_routes(app: FastAPI):
                     logger.info("Twilio WebSocket disconnected")
                     if not call_ended:
                         call_ended = True
-                        # Safety: end the PSTN call if we still know the callSid
                         try:
                             call_sid = stream_to_call.get(stream_sid)
                             if call_sid:
@@ -399,7 +399,6 @@ def setup_twilio_routes(app: FastAPI):
                                 f"Error ending call via Twilio API on disconnect: {e}"
                             )
                         finally:
-                            # Clean mapping regardless
                             cs = stream_to_call.pop(stream_sid, None)
                             if cs:
                                 call_to_article.pop(cs, None)
@@ -411,7 +410,7 @@ def setup_twilio_routes(app: FastAPI):
                     logger.info("receive_from_twilio task ending")
 
             async def send_to_twilio():
-                nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio, call_ended
+                nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio, call_ended, ai_audio_ms_sent, is_response_active
                 logger.info("Starting send_to_twilio task")
                 try:
                     async for openai_message in openai_ws:
@@ -420,6 +419,9 @@ def setup_twilio_routes(app: FastAPI):
                             break
 
                         response = json.loads(openai_message)
+
+                        if response.get("type") == "response.created":
+                            is_response_active = True
 
                         if response.get("type") == "session.created":
                             logger.info("OpenAI session created successfully")
@@ -443,16 +445,15 @@ def setup_twilio_routes(app: FastAPI):
                                 and "already shorter than"
                                 in response.get("error", {}).get("message", "")
                             ):
-                                # Audio truncation error - ei kriittinen
                                 logger.warning(
                                     f"Audio truncation timing error (non-critical): {response}"
                                 )
                             else:
-                                # Muut virheet
                                 logger.error(f"OpenAI error: {response}")
                             continue
 
-                        # KÄYTTÄJÄN TRANSCRIPTION KÄSITTELY - PALAUTETTU
+                        # Do not manually create responses; server VAD create_response=True handles it
+
                         if (
                             response.get("type")
                             == "conversation.item.input_audio_transcription.completed"
@@ -469,8 +470,8 @@ def setup_twilio_routes(app: FastAPI):
                                         {"speaker": "user", "text": transcript_text}
                                     )
 
-                        # KORJATTU: response.done käsittely oikeassa paikassa
                         if response.get("type") == "response.done":
+                            is_response_active = False
                             if SHOW_TIMING_MATH:
                                 print("[DEBUG] response.done received")
 
@@ -484,7 +485,6 @@ def setup_twilio_routes(app: FastAPI):
                                         ):
                                             transcript = part["transcript"]
 
-                                            # TUNNISTA LOPETUSSANAT
                                             end_phrases = [
                                                 "kiitos haastattelusta",
                                                 "hyvää päivänjatkoa",
@@ -499,18 +499,21 @@ def setup_twilio_routes(app: FastAPI):
                                                 logger.info(
                                                     f"🔚 Detected interview end phrase in: {transcript}"
                                                 )
-
-                                                # Anna AI:lle hetki sanoa loppuun (2 sekuntia)
                                                 await asyncio.sleep(2)
-
                                                 call_ended = True
                                                 logger.info(
                                                     "📞 Ending call after interview completion"
                                                 )
-
                                                 try:
-                                                    await websocket.close()
-                                                    await openai_ws.close()
+                                                    if websocket.client_state != WebSocketState.DISCONNECTED:
+                                                        await websocket.close()
+                                                    # Prefer `.closed` attr; fallback to `.open`
+                                                    if hasattr(openai_ws, "closed"):
+                                                        if not openai_ws.closed:
+                                                            await openai_ws.close()
+                                                    else:
+                                                        if getattr(openai_ws, "open", False):
+                                                            await openai_ws.close()
                                                     logger.info(
                                                         "✅ Call ended successfully"
                                                     )
@@ -518,10 +521,8 @@ def setup_twilio_routes(app: FastAPI):
                                                     logger.warning(
                                                         f"Error closing connections: {e}"
                                                     )
-
                                                 return
 
-                                            # Tavallinen logging - VAIN AI:n vastaukset
                                             if (
                                                 transcript
                                                 and stream_sid in conversation_logs
@@ -539,20 +540,25 @@ def setup_twilio_routes(app: FastAPI):
                             and stream_sid
                         ):
                             try:
-                                # THIS IS USED IN TWILIO EXAMPLE... EVEN ITS BIT WEIRD, LETS USE THIS
-                                audio_payload = base64.b64encode(
-                                    base64.b64decode(response["delta"])
-                                ).decode("utf-8")
-
-                                await websocket.send_json(
-                                    {
-                                        "event": "media",
-                                        "streamSid": stream_sid,
-                                        "media": {"payload": audio_payload},
-                                    }
+                                decoded_bytes = base64.b64decode(response["delta"])
+                                audio_payload = base64.b64encode(decoded_bytes).decode(
+                                    "utf-8"
                                 )
 
+                                if websocket.client_state == WebSocketState.CONNECTED:
+                                    await websocket.send_json(
+                                        {
+                                            "event": "media",
+                                            "streamSid": stream_sid,
+                                            "media": {"payload": audio_payload},
+                                        }
+                                    )
+                                else:
+                                    logger.info("WebSocket not connected; stopping audio send")
+                                    break
+
                                 if response_start_timestamp_twilio is None:
+                                    ai_audio_ms_sent = 0
                                     response_start_timestamp_twilio = (
                                         latest_media_timestamp
                                     )
@@ -560,6 +566,8 @@ def setup_twilio_routes(app: FastAPI):
                                         print(
                                             f"[DEBUG] set response_start_timestamp={response_start_timestamp_twilio}ms"
                                         )
+
+                                ai_audio_ms_sent += int(len(decoded_bytes) / 8)
                                 await send_mark(websocket, stream_sid)
                             except Exception as e:
                                 logger.error(f"Error sending audio to Twilio: {e}")
@@ -567,7 +575,8 @@ def setup_twilio_routes(app: FastAPI):
 
                         if response.get("type") == "response.audio.done":
                             logger.info("✔️ AI finished audio response")
-                            await websocket.send_json({"event": "ai_response_done"})
+                            if websocket.client_state == WebSocketState.CONNECTED:
+                                await websocket.send_json({"event": "ai_response_done"})
 
                         if response.get("type") == "input_audio_buffer.speech_started":
                             logger.info("🗣️ Speech started detected")
@@ -585,51 +594,68 @@ def setup_twilio_routes(app: FastAPI):
                     logger.info("send_to_twilio task ending")
 
             async def send_mark(connection, stream_sid_local):
-                """Send mark events to Twilio to indicate audio chunks have been sent."""
                 if stream_sid_local:
                     mark_event = {
                         "event": "mark",
                         "streamSid": stream_sid_local,
                         "mark": {"name": "responsePart"},
                     }
-                    await connection.send_json(mark_event)
+                    if connection.client_state == WebSocketState.CONNECTED:
+                        await connection.send_json(mark_event)
                     mark_queue.append("responsePart")
                     if SHOW_TIMING_MATH:
                         print("[DEBUG] sent mark=responsePart")
 
             async def handle_speech_started_event():
-                """Truncate AI response when user starts speaking - with IMPROVED timing."""
-                nonlocal response_start_timestamp_twilio, last_assistant_item, stream_sid
+                nonlocal response_start_timestamp_twilio, last_assistant_item, stream_sid, ai_audio_ms_sent
 
-                if not last_assistant_item or response_start_timestamp_twilio is None:
+                if not last_assistant_item:
                     logger.info("No active response to interrupt")
                     return
 
-                elapsed = latest_media_timestamp - response_start_timestamp_twilio
+                # Ensure we have AI audio to truncate
+                if ai_audio_ms_sent <= 0:
+                    logger.info("No AI audio sent yet, skipping truncate")
+                    return
 
-                #  Anna AI:lle aikaa sanoa asiansa loppuun
-                if elapsed < 3000:  # NOSTETTU 500ms → 3000ms (3 sekuntia)
+                # Optional gate: let AI speak at least a minimum before truncation
+                MIN_AI_SPEECH_MS = 1000  # tune 0–1000 based on desired responsiveness
+                if ai_audio_ms_sent < MIN_AI_SPEECH_MS:
                     logger.info(
-                        f"Too early to interrupt AI ({elapsed}ms) - letting it finish"
+                        f"AI audio too short ({ai_audio_ms_sent}ms) - letting it reach minimum duration"
+                    )
+                    return
+
+                # Truncate point based ONLY on audio we've actually sent to Twilio
+                TRUNCATE_BUFFER_MS = 150  # small safety buffer
+                audio_end_ms = max(0, ai_audio_ms_sent - TRUNCATE_BUFFER_MS)
+                if audio_end_ms <= 0:
+                    logger.info(
+                        "Audio too short to truncate safely after buffer, skipping"
                     )
                     return
 
                 if SHOW_TIMING_MATH:
-                    print(f"[DEBUG] truncating at {elapsed}ms")
+                    print(
+                        f"[DEBUG] truncating at {audio_end_ms}ms (AI sent={ai_audio_ms_sent}ms, buffer={TRUNCATE_BUFFER_MS}ms)"
+                    )
 
                 try:
                     truncate_event = {
                         "type": "conversation.item.truncate",
                         "item_id": last_assistant_item,
                         "content_index": 0,
-                        "audio_end_ms": elapsed,
+                        "audio_end_ms": audio_end_ms,
                     }
                     await openai_ws.send(json.dumps(truncate_event))
-                    await websocket.send_json(
-                        {"event": "clear", "streamSid": stream_sid}
-                    )
+                    if websocket.client_state == WebSocketState.CONNECTED:
+                        await websocket.send_json(
+                            {"event": "clear", "streamSid": stream_sid}
+                        )
                     mark_queue.clear()
-                    logger.info(f"✂️ Truncated audio at {elapsed}ms")
+                    logger.info(
+                        f"✂️ Truncated AI audio at {audio_end_ms}ms (of {ai_audio_ms_sent}ms total)"
+                    )
 
                 except Exception as e:
                     logger.warning(f"Audio truncation failed (non-critical): {e}")
@@ -638,6 +664,7 @@ def setup_twilio_routes(app: FastAPI):
                 finally:
                     last_assistant_item = None
                     response_start_timestamp_twilio = None
+                    ai_audio_ms_sent = 0
 
             logger.info("Starting async tasks for media stream")
             tasks = [
@@ -653,12 +680,12 @@ def setup_twilio_routes(app: FastAPI):
             call_ended = True
 
             for task in pending:
-                logger.info(f"Cancelling pending task")
+                logger.info("Cancelling pending task")
                 task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
-                    logger.info(f"Task cancelled successfully")
+                    logger.info("Task cancelled successfully")
 
             logger.info("Media stream tasks completed")
 
@@ -669,13 +696,19 @@ def setup_twilio_routes(app: FastAPI):
 
             if openai_ws:
                 try:
-                    await openai_ws.close()
+                    if hasattr(openai_ws, "closed"):
+                        if not openai_ws.closed:
+                            await openai_ws.close()
+                    else:
+                        if getattr(openai_ws, "open", False):
+                            await openai_ws.close()
                     logger.info("OpenAI WebSocket closed")
                 except Exception as e:
                     logger.error(f"Error closing OpenAI WebSocket: {e}")
 
             try:
-                await websocket.close()
+                if websocket.client_state != WebSocketState.DISCONNECTED:
+                    await websocket.close()
                 logger.info("Twilio WebSocket closed")
             except Exception as e:
                 logger.error(f"Error closing Twilio WebSocket: {e}")
@@ -759,10 +792,11 @@ async def initialize_session(openai_ws):
             "instructions": instructions,
             "modalities": ["text", "audio"],
             "temperature": temperature,
+            "language": "fi",
             # LISÄTTY: Transcription käyttäjän äänelle
             "input_audio_transcription": {
                 "model": "whisper-1",
-                #"language": language,
+                # "language": language,
                 "language": "fi",
                 "prompt": TRANSCRIPTION_PROMPT,
             },
