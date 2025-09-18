@@ -2,9 +2,10 @@ import os
 import json
 import base64
 import asyncio
-from urllib import response
+import httpx
 import websockets
 import logging
+from dotenv import load_dotenv
 from itertools import groupby
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -13,6 +14,8 @@ from starlette.websockets import WebSocketState
 from twilio.twiml.voice_response import VoiceResponse, Connect
 from twilio.rest import Client
 from datetime import datetime
+
+load_dotenv()
 
 SYSTEM_MESSAGE = (
     "You are a journalist conducting a relaxed and friendly interview in Finnish. "
@@ -952,6 +955,8 @@ async def update_interview_by_article_id(article_id, dialogue_turns):
             logger.info(
                 f"📊 Updated interview ID {interview_id} for article {article_id} with transcript ({len(dialogue_turns)} turns)"
             )
+            asyncio.create_task(send_phone_interview_webhook(article_id, dialogue_turns))
+            logger.info("📤 Webhook queued (fire-and-forget)")
         else:
             logger.warning(
                 f"⚠️ No initiated phone_interview found for article: {article_id}"
@@ -966,3 +971,33 @@ async def update_interview_by_article_id(article_id, dialogue_turns):
     except Exception as e:
         logger.error(f"❌ Failed to update interview in database: {e}")
         return None
+
+# WHEN interview is completed, we send a webhook to callback-server
+# This will trigger news enrichment and publishing process
+async def send_phone_interview_webhook(article_id: int, interview_content: list):
+    """
+    Lähettää puhelinhaastattelun webhook callback-serverille.
+    Vain article_id ja interview_content - yksinkertaista!
+    """
+    url = os.getenv("PHONE_INTERVIEW_WEBHOOK_URL")
+    if not url:
+        logger.info("PHONE_INTERVIEW_WEBHOOK_URL not set; skipping webhook")
+        return
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Webhook-Secret": os.getenv("WEBHOOK_SECRET", ""),
+    }
+
+    payload = {"article_id": article_id, "interview": interview_content}
+    
+    print("TÄÄ LÄHETETÄÄN! ",payload )
+    print(payload)
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()  # 202 Accepted on ok
+        logger.info(f"✅ Phone interview webhook lähetetty: article_id={article_id}")
+    except Exception as e:
+        logger.error(f"❌ Phone interview webhook epäonnistui: {e}")
